@@ -1,0 +1,475 @@
+-- 从网上下载 Rayfield UI 库（这是做界面用的）
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- 获取 Roblox 内置的几个服务（相当于工具箱）
+local Players = game:GetService("Players")           -- 玩家服务
+local RunService = game:GetService("RunService")     -- 每帧运行服务
+local UIS = game:GetService("UserInputService")      -- 键盘鼠标输入服务
+local Camera = workspace.CurrentCamera               -- 当前摄像机
+local LP = Players.LocalPlayer                       -- 本地玩家（你自己）
+local Config = {
+    -- ===== 自瞄相关 =====
+    AimbotEnabled = false,      -- 自瞄总开关，默认关闭
+    AimSmoothness = 0.25,       -- 平滑度，越小越慢越稳（0.05~1）
+    AimSpeed = 1,               -- 自瞄速度倍率
+    AimPart = "Head",           -- 瞄准哪个部位，默认头
+    Distance = 500,             -- 最大自瞄距离（米）
+    TeamCheck = true,           -- 队伍识别（不打队友）
+    WallCheck = true,           -- 掩体识别（隔墙不打）
+
+    -- ===== FOV 圆圈相关 =====
+    FOVRadius = 120,            -- 圆圈半径（像素）
+    FOVColor = Color3.fromRGB(255, 255, 255),  -- 默认白色
+    FOVThickness = 1.5,         -- 圆圈线条粗细
+    FOVTransparency = 0.9,      -- 圆圈透明度（1=全透明，0=不透明）
+
+    -- ===== 透视相关 =====
+    ESPEnabled = false,         -- 透视总开关
+    ESPTeamCheck = true,        -- 透视队伍识别（队友绿/敌人红）
+    ESPShowName = true,         -- 显示名字
+    ESPShowHealth = true,       -- 显示血量
+    ESPShowDistance = true,     -- 显示距离
+}
+-- 创建一个圆（Drawing 是画图工具，能画在屏幕上）
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.NumSides = 100        -- 用100个边来画圆，越多越圆滑
+FOVCircle.Filled = false        -- 空心（不填充内部）
+FOVCircle.Thickness = 1.5       -- 线条粗细
+FOVCircle.Color = Color3.fromRGB(255, 255, 255)  -- 白色
+FOVCircle.Radius = 120          -- 半径
+FOVCircle.Transparency = 0.9    -- 透明度
+FOVCircle.Visible = false       -- 一开始不显示
+
+-- 中间画一个小十字准星（横线）
+local CrossH = Drawing.new("Line")
+CrossH.Thickness = 1
+CrossH.Color = Color3.fromRGB(255, 255, 255)
+CrossH.Transparency = 0.9
+CrossH.Visible = false
+
+-- 中间画一个小十字准星（竖线）
+local CrossV = Drawing.new("Line")
+CrossV.Thickness = 1
+CrossV.Color = Color3.fromRGB(255, 255, 255)
+CrossV.Transparency = 0.9
+CrossV.Visible = false
+
+-- 每一帧都更新圆圈位置（保证它一直待在屏幕正中央）
+RunService.RenderStepped:Connect(function()
+    -- ViewportSize/2 就是屏幕正中间那个点，X 和 Y 都取一半
+    local center = Camera.ViewportSize / 2
+
+    -- 圆圈的位置 = 屏幕正中央
+    FOVCircle.Position = center
+    FOVCircle.Radius = Config.FOVRadius                    -- 半径跟着配置走
+    FOVCircle.Thickness = Config.FOVThickness              -- 粗细跟着配置走
+    FOVCircle.Color = Config.FOVColor                      -- 颜色跟着配置走
+    FOVCircle.Transparency = Config.FOVTransparency        -- 透明度跟着配置走
+    FOVCircle.Visible = Config.AimbotEnabled               -- 开了自瞄才显示
+
+    -- 横线：中心点左右各 5 像素
+    CrossH.From = Vector2.new(center.X - 5, center.Y)
+    CrossH.To = Vector2.new(center.X + 5, center.Y)
+    CrossH.Visible = Config.AimbotEnabled
+
+    -- 竖线：中心点上下各 5 像素
+    CrossV.From = Vector2.new(center.X, center.Y - 5)
+    CrossV.To = Vector2.new(center.X, center.Y + 5)
+    CrossV.Visible = Config.AimbotEnabled
+end)
+-- 创建射线检测参数（用来判断你和目标之间有没有墙）
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude  -- 排除某些物体不检测
+rayParams.IgnoreWater = true                           -- 忽略水
+
+-- 队伍识别函数：判断某个玩家是不是你的队友
+local function isSameTeam(plr)
+    if not Config.TeamCheck then return false end      -- 没开队伍识别就直接返回"不是队友"
+    if plr.Team == nil or LP.Team == nil then return false end  -- 没队伍也返回 false
+    return plr.Team == LP.Team                          -- 队友就返回 true
+end
+
+-- 掩体识别函数：判断你和目标之间有没有墙挡着
+-- partName 是要检测目标的哪个部位
+local function hasLineOfSight(plr, partName)
+    if not Config.WallCheck then return true end       -- 没开掩体识别就直接返回"能看见"
+    if not LP.Character then return false end          -- 你自己没角色也返回看不见
+
+    -- 找到目标身上的指定部位
+    local tPart = plr.Character and plr.Character:FindFirstChild(partName)
+    if not tPart then return false end
+
+    -- 排除列表：你自己的角色、目标的角色、队伍指示器
+    local filter = {LP.Character, plr.Character}
+    local ti = workspace:FindFirstChild("TeamIndicators")
+    if ti then table.insert(filter, ti) end
+    rayParams.FilterDescendantsInstances = filter
+
+    -- 从摄像机位置向目标发射一条射线
+    local origin = Camera.CFrame.Position
+    local dir = tPart.Position - origin
+    local result = workspace:Raycast(origin, dir, rayParams)
+
+    -- 如果射线什么都没打到 = 中间没墙 = 能看见
+    return result == nil
+end
+-- 找出屏幕正中心最近的敌人
+local function findTarget()
+    local closest = nil                        -- 最终返回的目标
+    local shortest = Config.FOVRadius          -- 最短距离（先设为 FOV 半径）
+    local center = Camera.ViewportSize / 2     -- 屏幕正中心
+
+    -- 遍历所有玩家
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LP then continue end               -- 跳过自己
+        if isSameTeam(plr) then continue end         -- 跳过队友
+        if not plr.Character then continue end       -- 跳过没角色的
+
+        -- 检查目标是否活着
+        local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then continue end
+
+        -- 找到要瞄准的部位（找不到就用身体中心代替）
+        local part = plr.Character:FindFirstChild(Config.AimPart)
+            or plr.Character:FindFirstChild("HumanoidRootPart")
+        if not part then continue end
+
+        -- 把目标的 3D 坐标转换成屏幕上的 2D 坐标
+        local pos, onScreen = Camera:WorldToViewportPoint(part.Position)
+        if not onScreen then continue end            -- 不在屏幕上就跳过
+
+        -- 算一下目标离屏幕中心有多远
+        local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
+        if d > Config.FOVRadius then continue end    -- 超出 FOV 圈就跳过
+
+        -- 检查距离是否超过自瞄距离上限
+        local myHrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+        local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
+        if myHrp and tHrp then
+            if (myHrp.Position - tHrp.Position).Magnitude > Config.Distance then
+                continue
+            end
+        end
+
+        -- 检查中间有没有墙挡着
+        if not hasLineOfSight(plr, Config.AimPart) then continue end
+
+        -- 记录最近的
+        if d < shortest then
+            shortest = d
+            closest = part
+        end
+    end
+    return closest
+end
+-- 每一帧都运行
+RunService.RenderStepped:Connect(function()
+    if not Config.AimbotEnabled then return end       -- 没开自瞄就退出
+    local target = findTarget()                        -- 找目标
+    if not target then return end                      -- 没目标就退出
+
+    local camPos = Camera.CFrame.Position              -- 摄像机当前位置
+    local desired = CFrame.new(camPos, target.Position)  -- 想要看向的位置
+
+    -- alpha 是插值系数，越大转得越快
+    local alpha = math.clamp(Config.AimSmoothness * Config.AimSpeed, 0.01, 1)
+
+    -- Lerp 是"线性插值"，让摄像机平滑过渡到目标方向
+    -- 就像缓慢转动脑袋看向目标，而不是瞬间甩过去
+    Camera.CFrame = Camera.CFrame:Lerp(desired, alpha)
+end)
+local espCache = {}   -- 缓存每个玩家的透视对象，避免重复创建
+
+-- 给某个玩家创建/更新透视
+local function ensureESP(plr)
+    if plr == LP then return end                 -- 跳过自己
+    if not plr.Character then return end         -- 没角色跳过
+
+    local data = espCache[plr]
+
+    -- 如果这个玩家还没有透视对象，就创建一套
+    if not data then
+        -- Highlight：让整个人物发光（穿透显示）
+        local hl = Instance.new("Highlight")
+        hl.Name = "PiESP_HL"
+        hl.FillTransparency = 0.5                -- 内部半透明
+        hl.OutlineTransparency = 0               -- 边框不透明
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop  -- 永远显示在最前面
+        hl.Parent = game:GetService("CoreGui")
+
+        -- BillboardGui：在头顶上方显示文字
+        local bb = Instance.new("BillboardGui")
+        bb.Name = "PiESP_BB"
+        bb.Size = UDim2.new(0, 200, 0, 60)        -- 200x60 像素
+        bb.StudsOffset = Vector3.new(0, 3, 0)     -- 头顶上方 3 格
+        bb.AlwaysOnTop = true
+        bb.Parent = game:GetService("CoreGui")
+
+        -- 名字文字
+        local n = Instance.new("TextLabel", bb)
+        n.Name = "NameLbl"
+        n.Size = UDim2.new(1, 0, 0.4, 0)          -- 占顶部 40%
+        n.BackgroundTransparency = 1               -- 背景透明
+        n.TextColor3 = Color3.new(1, 1, 1)
+        n.TextStrokeTransparency = 0.5             -- 描边半透明
+        n.TextScaled = true                        -- 自动缩放
+        n.Font = Enum.Font.GothamSemibold
+
+        -- 血量文字
+        local h = Instance.new("TextLabel", bb)
+        h.Name = "HealthLbl"
+        h.Position = UDim2.new(0, 0, 0.4, 0)       -- 从 40% 处开始
+        h.Size = UDim2.new(1, 0, 0.3, 0)
+        h.BackgroundTransparency = 1
+        h.TextColor3 = Color3.new(0, 1, 0)
+        h.TextStrokeTransparency = 0.5
+        h.TextScaled = true
+        h.Font = Enum.Font.GothamSemibold
+
+        -- 距离文字
+        local dL = Instance.new("TextLabel", bb)
+        dL.Name = "DistLbl"
+        dL.Position = UDim2.new(0, 0, 0.7, 0)      -- 从 70% 处开始
+        dL.Size = UDim2.new(1, 0, 0.3, 0)
+        dL.BackgroundTransparency = 1
+        dL.TextColor3 = Color3.new(1, 1, 0)
+        dL.TextStrokeTransparency = 0.5
+        dL.TextScaled = true
+        dL.Font = Enum.Font.GothamSemibold
+
+        -- 把创建的对象存起来
+        data = {HL = hl, BB = bb, N = n, H = h, D = dL}
+        espCache[plr] = data
+    end
+
+    -- 如果透视总开关关了，或者目标没角色了，就隐藏
+    if not Config.ESPEnabled or not plr.Character then
+        data.HL.Enabled = false
+        data.BB.Enabled = false
+        return
+    end
+
+    -- 判断是队友还是敌人，决定颜色
+    local isMate = Config.ESPTeamCheck and plr.Team == LP.Team
+    local color = isMate and Color3.fromRGB(0, 255, 0)    -- 队友绿色
+                       or Color3.fromRGB(255, 0, 0)       -- 敌人红色
+
+    -- 更新发光
+    data.HL.Adornee = plr.Character
+    data.HL.FillColor = color
+    data.HL.OutlineColor = color
+    data.HL.Enabled = true
+
+    -- 把文字框挂在头顶
+    local head = plr.Character:FindFirstChild("Head")
+    if head then data.BB.Adornee = head end
+    data.BB.Enabled = Config.ESPShowName or Config.ESPShowHealth or Config.ESPShowDistance
+
+    -- 名字
+    data.N.Visible = Config.ESPShowName
+    data.N.Text = plr.Name .. (isMate and " [队友]" or " [敌人]")
+    data.N.TextColor3 = color
+
+    -- 血量
+    local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+    data.H.Visible = Config.ESPShowHealth
+    if hum then
+        data.H.Text = string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth))
+    end
+
+    -- 距离
+    data.D.Visible = Config.ESPShowDistance
+    local myHrp = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+    local tHrp = plr.Character:FindFirstChild("HumanoidRootPart")
+    if myHrp and tHrp then
+        data.D.Text = string.format("%d m", math.floor((myHrp.Position - tHrp.Position).Magnitude))
+    end
+end
+
+-- 每 1/60 秒更新一次所有玩家的透视
+RunService.Heartbeat:Connect(function()
+    for _, plr in ipairs(Players:GetPlayers()) do
+        ensureESP(plr)
+    end
+end)
+
+-- 玩家离开时，销毁他的透视对象，防止内存泄漏
+Players.PlayerRemoving:Connect(function(plr)
+    if espCache[plr] then
+        espCache[plr].HL:Destroy()
+        espCache[plr].BB:Destroy()
+        espCache[plr] = nil
+    end
+end)
+-- 创建主窗口
+local Window = Rayfield:CreateWindow({
+    Name = "皮脚本 · 自瞄/透视",       -- 窗口标题
+    LoadingTitle = "加载中...",
+    LoadingSubtitle = "Aimbot + ESP",
+    ConfigurationSaving = { Enabled = false },
+})
+
+-- 横向布局：创建两个 Tab（左侧大类）
+local AimTab = Window:CreateTab("自瞄", 4483362458)   -- 自瞄大类
+local ESPTab = Window:CreateTab("透视", 4483362458)   -- 透视大类
+
+-- =====================================
+-- 自瞄 Tab 里的所有设置
+-- =====================================
+AimTab:CreateSection("总开关")   -- 分节标题
+
+-- 自瞄总开关
+AimTab:CreateToggle({
+    Name = "启用自瞄",
+    CurrentValue = false,
+    Flag = "AimbotEnabled",
+    Callback = function(v) Config.AimbotEnabled = v end,  -- 点一下切开关
+})
+
+AimTab:CreateSection("识别（队伍 / 掩体）")
+
+-- 队伍识别开关
+AimTab:CreateToggle({
+    Name = "队伍识别",
+    CurrentValue = true,
+    Flag = "TeamCheck",
+    Callback = function(v) Config.TeamCheck = v end,
+})
+
+-- 掩体识别开关
+AimTab:CreateToggle({
+    Name = "掩体识别",
+    CurrentValue = true,
+    Flag = "WallCheck",
+    Callback = function(v) Config.WallCheck = v end,
+})
+
+AimTab:CreateSection("参数调节（全部可拖动）")
+
+-- 平滑度滑块
+AimTab:CreateSlider({
+    Name = "自瞄平滑度（越小越慢越稳）",
+    Range = {0.05, 1},        -- 最小值 0.05，最大值 1
+    Increment = 0.01,         -- 每次拖动 0.01
+    CurrentValue = 0.25,      -- 默认值
+    Flag = "AimSmoothness",
+    Callback = function(v) Config.AimSmoothness = v end,
+})
+
+-- 自瞄速度滑块
+AimTab:CreateSlider({
+    Name = "自瞄速度",
+    Range = {0.1, 3},
+    Increment = 0.1,
+    CurrentValue = 1,
+    Flag = "AimSpeed",
+    Callback = function(v) Config.AimSpeed = v end,
+})
+
+-- 距离滑块
+AimTab:CreateSlider({
+    Name = "自瞄范围距离 (m)",
+    Range = {50, 2000},
+    Increment = 10,
+    CurrentValue = 500,
+    Flag = "Distance",
+    Callback = function(v) Config.Distance = v end,
+})
+
+AimTab:CreateSection("FOV 圆圈（居中的空心圆）")
+
+-- FOV 半径滑块
+AimTab:CreateSlider({
+    Name = "FOV 大小",
+    Range = {30, 500},
+    Increment = 5,
+    CurrentValue = 120,
+    Flag = "FOVRadius",
+    Callback = function(v) Config.FOVRadius = v end,
+})
+
+-- FOV 粗细滑块
+AimTab:CreateSlider({
+    Name = "FOV 粗细",
+    Range = {1, 10},
+    Increment = 0.5,
+    CurrentValue = 1.5,
+    Flag = "FOVThickness",
+    Callback = function(v) Config.FOVThickness = v end,
+})
+
+-- FOV 透明度滑块
+AimTab:CreateSlider({
+    Name = "FOV 透明度",
+    Range = {0, 1},
+    Increment = 0.05,
+    CurrentValue = 0.9,
+    Flag = "FOVTransparency",
+    Callback = function(v) Config.FOVTransparency = v end,
+})
+
+-- FOV 颜色选择器（默认白色）
+AimTab:CreateColorPicker({
+    Name = "FOV 颜色（默认白色）",
+    Color = Color3.fromRGB(255, 255, 255),
+    Flag = "FOVColor",
+    Callback = function(v) Config.FOVColor = v end,
+})
+
+AimTab:CreateSection("锁定部位")
+
+-- 自瞄部位下拉菜单
+AimTab:CreateDropdown({
+    Name = "自瞄部位",
+    Options = {"Head", "HumanoidRootPart", "UpperTorso", "LowerTorso", "Torso"},
+    CurrentOption = {"Head"},     -- 默认头
+    Flag = "AimPart",
+    Callback = function(v) Config.AimPart = v[1] end,   -- v 是数组，取第一个
+})
+
+-- =====================================
+-- 透视 Tab 里的所有设置
+-- =====================================
+ESPTab:CreateSection("总开关")
+
+-- 透视总开关
+ESPTab:CreateToggle({
+    Name = "启用透视",
+    CurrentValue = false,
+    Flag = "ESPEnabled",
+    Callback = function(v) Config.ESPEnabled = v end,
+})
+
+-- 透视队伍识别开关
+ESPTab:CreateToggle({
+    Name = "透视队伍识别（队友绿 / 敌人红）",
+    CurrentValue = true,
+    Flag = "ESPTeamCheck",
+    Callback = function(v) Config.ESPTeamCheck = v end,
+})
+
+ESPTab:CreateSection("显示内容")
+
+-- 显示名字
+ESPTab:CreateToggle({
+    Name = "显示名字",
+    CurrentValue = true,
+    Flag = "ESPShowName",
+    Callback = function(v) Config.ESPShowName = v end,
+})
+
+-- 显示血量
+ESPTab:CreateToggle({
+    Name = "显示血量",
+    CurrentValue = true,
+    Flag = "ESPShowHealth",
+    Callback = function(v) Config.ESPShowHealth = v end,
+})
+
+-- 显示距离
+ESPTab:CreateToggle({
+    Name = "显示距离",
+    CurrentValue = true,
+    Flag = "ESPShowDistance",
+    Callback = function(v) Config.ESPShowDistance = v end,
+})
